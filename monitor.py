@@ -13,6 +13,7 @@ import re
 import sys
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -27,7 +28,7 @@ except ImportError:
 # CẤU HÌNH HỆ THỐNG (CONFIGURATION)
 # ==============================================================================
 
-DEFAULT_TARGET_URL = "https://edmonton.afedmonton.ca/community/event-rsvp/?event_id=123"
+DEFAULT_TARGET_URL = "https://www.afedmonton.com/en/exams/tcf/?s8-datatable1_rows=75"
 TARGET_URL = os.getenv("TARGET_URL", DEFAULT_TARGET_URL).strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -196,70 +197,130 @@ def is_slot_available(spots_text: str, bookings_text: str, action_url: Optional[
 def parse_html_table(html_content: str) -> List[Dict[str, Any]]:
     """
     Bóc tách bảng danh sách kỳ thi từ mã nguồn HTML.
-    Hỗ trợ cả cấu trúc <table> chuẩn và các thẻ div/card nếu có.
+    Tự động nhận diện tiêu đề các cột (Exam, Schedules, Spots left, Bookings, ...)
+    để trích xuất chính xác 100% dù bảng có 5, 6, 7 hay nhiều cột hơn.
     """
     soup = BeautifulSoup(html_content, "html.parser")
     found_slots = []
 
-    # 1. Tìm trong tất cả các thẻ <tr> của <table>
-    rows = soup.find_all("tr")
-    for row in rows:
-        cells = row.find_all(["td", "th"])
-        row_text = row.get_text(" ", strip=True)
+    # 1. Quét qua các thẻ <table> trong tài liệu
+    tables = soup.find_all("table")
+    if not tables:
+        # Fallback tìm các thẻ <tr> rời rạc nếu không có thẻ <table> bọc
+        tables = [soup]
 
-        # Lọc kỳ thi TCF (TCF Canada, TCF IRN, v.v.)
-        if "TCF" not in row_text.upper():
-            continue
+    for table in tables:
+        # Nhận diện tiêu đề cột từ <th> trong <thead> hoặc dòng đầu tiên
+        col_map = {}
+        thead = table.find("thead")
+        th_cells = thead.find_all("th") if thead else []
+        if not th_cells:
+            first_tr = table.find("tr")
+            if first_tr:
+                th_cells = first_tr.find_all("th")
 
-        exam_name = ""
-        schedules = ""
-        reg_dates = ""
-        location = ""
-        spots_left = ""
-        bookings = ""
-        action_url = None
+        for idx, th in enumerate(th_cells):
+            htext = th.get_text(" ", strip=True).lower()
+            if "exam" in htext:
+                col_map["exam"] = idx
+            elif "schedul" in htext:
+                col_map["schedules"] = idx
+            elif "reg" in htext:
+                col_map["reg_dates"] = idx
+            elif "locat" in htext:
+                col_map["location"] = idx
+            elif "spot" in htext:
+                col_map["spots_left"] = idx
+            elif "price" in htext:
+                col_map["price"] = idx
+            elif "book" in htext:
+                col_map["bookings"] = idx
 
-        # Trích xuất link đăng ký nếu có trong thẻ <a>
-        link_tag = row.find("a", href=True)
-        if link_tag:
-            action_url = link_tag["href"]
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = row.find_all(["td", "th"])
+            # Bỏ qua dòng tiêu đề
+            if row.find("th") and not row.find("td"):
+                continue
 
-        if len(cells) >= 4:
-            # Cấu trúc bảng tiêu chuẩn:
-            # Col 0: Exam, Col 1: Schedules, Col 2: Reg Dates, Col 3: Location (hoặc Spots), Col 4: Bookings
-            exam_name = cells[0].get_text(" ", strip=True)
-            schedules = cells[1].get_text(" ", strip=True)
-            if len(cells) >= 5:
-                reg_dates = cells[2].get_text(" ", strip=True)
-                spots_left = cells[3].get_text(" ", strip=True)
-                bookings = cells[4].get_text(" ", strip=True)
-            elif len(cells) == 4:
-                spots_left = cells[2].get_text(" ", strip=True)
-                bookings = cells[3].get_text(" ", strip=True)
-        else:
-            # Fallback nếu bảng không chuẩn
-            exam_name = row_text[:50]
-            schedules = row_text
-            spots_left = row_text
-            bookings = row_text
+            row_text = row.get_text(" ", strip=True)
+            if "TCF" not in row_text.upper():
+                continue
 
-        # Trích xuất ngày thi
-        exam_date = extract_date_from_text(schedules) or extract_date_from_text(exam_name) or extract_date_from_text(row_text)
+            exam_name = ""
+            schedules = ""
+            reg_dates = ""
+            location = ""
+            spots_left = ""
+            bookings = ""
+            action_url = None
 
-        available, status_desc = is_slot_available(spots_left, bookings, action_url)
+            # Tìm link đăng ký
+            link_tag = row.find("a", href=True)
+            if link_tag:
+                action_url = urljoin(TARGET_URL, link_tag["href"])
 
-        found_slots.append({
-            "exam_name": exam_name or "TCF Canada",
-            "exam_date": exam_date,
-            "schedules": schedules or exam_name,
-            "location": location or "Alliance Française of Edmonton",
-            "spots_left": spots_left,
-            "bookings": bookings,
-            "action_url": action_url,
-            "available": available,
-            "status_desc": status_desc,
-            "raw_text": row_text
-        })
+            if col_map:
+                # Ánh xạ động theo tiêu đề cột
+                if "exam" in col_map and col_map["exam"] < len(cells):
+                    exam_name = cells[col_map["exam"]].get_text(" ", strip=True)
+                if "schedules" in col_map and col_map["schedules"] < len(cells):
+                    schedules = cells[col_map["schedules"]].get_text(" ", strip=True)
+                if "reg_dates" in col_map and col_map["reg_dates"] < len(cells):
+                    reg_dates = cells[col_map["reg_dates"]].get_text(" ", strip=True)
+                if "location" in col_map and col_map["location"] < len(cells):
+                    location = cells[col_map["location"]].get_text(" ", strip=True)
+                if "spots_left" in col_map and col_map["spots_left"] < len(cells):
+                    spots_left = cells[col_map["spots_left"]].get_text(" ", strip=True)
+                if "bookings" in col_map and col_map["bookings"] < len(cells):
+                    bookings_cell = cells[col_map["bookings"]]
+                    bookings = bookings_cell.get_text(" ", strip=True)
+                    cell_link = bookings_cell.find("a", href=True)
+                    if cell_link:
+                        action_url = urljoin(TARGET_URL, cell_link["href"])
+            else:
+                # Fallback cấu trúc vị trí nếu không có thẻ <th>
+                if len(cells) >= 7:
+                    exam_name = cells[0].get_text(" ", strip=True)
+                    schedules = cells[1].get_text(" ", strip=True)
+                    reg_dates = cells[2].get_text(" ", strip=True)
+                    location = cells[3].get_text(" ", strip=True)
+                    spots_left = cells[4].get_text(" ", strip=True)
+                    bookings = cells[6].get_text(" ", strip=True)
+                elif len(cells) >= 5:
+                    exam_name = cells[0].get_text(" ", strip=True)
+                    schedules = cells[1].get_text(" ", strip=True)
+                    reg_dates = cells[2].get_text(" ", strip=True)
+                    spots_left = cells[3].get_text(" ", strip=True)
+                    bookings = cells[4].get_text(" ", strip=True)
+                elif len(cells) == 4:
+                    exam_name = cells[0].get_text(" ", strip=True)
+                    schedules = cells[1].get_text(" ", strip=True)
+                    spots_left = cells[2].get_text(" ", strip=True)
+                    bookings = cells[3].get_text(" ", strip=True)
+                else:
+                    exam_name = row_text[:50]
+                    schedules = row_text
+                    spots_left = row_text
+                    bookings = row_text
+
+            # Trích xuất ngày thi
+            exam_date = extract_date_from_text(schedules) or extract_date_from_text(exam_name) or extract_date_from_text(row_text)
+
+            available, status_desc = is_slot_available(spots_left, bookings, action_url)
+
+            found_slots.append({
+                "exam_name": exam_name or "TCF Canada",
+                "exam_date": exam_date,
+                "schedules": schedules or exam_name,
+                "location": location or "Alliance Française of Edmonton",
+                "spots_left": spots_left,
+                "bookings": bookings,
+                "action_url": action_url,
+                "available": available,
+                "status_desc": status_desc,
+                "raw_text": row_text
+            })
 
     return found_slots
 
