@@ -1,0 +1,62 @@
+name: TCF Edmonton Slot Monitor
+
+on:
+  schedule:
+    # Chạy tự động định kỳ mỗi 10 phút suốt 24/7
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: 'Gửi tin nhắn test kiểm tra kết nối Telegram Bot'
+        required: false
+        type: boolean
+        default: false
+      force:
+        description: 'Bỏ qua cache chống spam (gửi tin nhắn ngay nếu phát hiện slot)'
+        required: false
+        type: boolean
+        default: false
+
+# Giới hạn chỉ cho phép 1 lần chạy đồng thời để tránh race conditions
+concurrency:
+  group: tcf-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-slots:
+    name: Quét Suất Thi TCF Edmonton
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📥 Tải mã nguồn repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Cài đặt môi trường Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Cài đặt thư viện dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🔍 Chạy Monitor Script quét suất thi
+        env:
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          START_DATE: ${{ vars.START_DATE || '2026-11-23' }}
+          END_DATE: ${{ vars.END_DATE || '2026-12-15' }}
+        run: |
+          if [ "${{ github.event.inputs.test_telegram }}" = "true" ]; then
+            echo "⚡ Đang chạy chế độ kiểm tra Telegram..."
+            python monitor.py --test-telegram
+          elif [ "${{ github.event.inputs.force }}" = "true" ]; then
+            echo "⚡ Đang chạy chế độ bắt buộc gửi alert..."
+            python monitor.py --force
+          else
+            python monitor.py
+          fi

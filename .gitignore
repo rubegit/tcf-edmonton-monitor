@@ -1,0 +1,19 @@
+# Environment variables & secrets
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Cache / Alert state
+.last_alert.json
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# OS specific
+.DS_Store
+Thumbs.db
